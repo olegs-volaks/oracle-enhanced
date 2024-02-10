@@ -12,10 +12,14 @@ module ActiveRecord
         def execute(sql, name = nil, async: false)
           sql = transform_query(sql)
 
-          log(sql, name, async: async) { @raw_connection.exec(sql) }
+          log(sql, name, async: async) { any_raw_connection.exec(sql) }
         end
 
         def exec_query(sql, name = "SQL", binds = [], prepare: false, async: false)
+          internal_exec_query(sql, name, binds, prepare: prepare, async: async)
+        end
+
+        def internal_exec_query(sql, name = "SQL", binds = [], prepare: false, async: false)
           sql = transform_query(sql)
 
           type_casted_binds = type_casted_binds(binds)
@@ -25,10 +29,10 @@ module ActiveRecord
             cached = false
             with_retry do
               if without_prepared_statement?(binds)
-                cursor = @raw_connection.prepare(sql)
+                cursor = any_raw_connection.prepare(sql)
               else
                 unless @statements.key? sql
-                  @statements[sql] = @raw_connection.prepare(sql)
+                  @statements[sql] = any_raw_connection.prepare(sql)
                 end
 
                 cursor = @statements[sql]
@@ -77,7 +81,7 @@ module ActiveRecord
 
         # New method in ActiveRecord 3.1
         # Will add RETURNING clause in case of trigger generated primary keys
-        def sql_for_insert(sql, pk, binds)
+        def sql_for_insert(sql, pk, binds, returning)
           unless pk == false || pk.nil? || pk.is_a?(Array) || pk.is_a?(String)
             sql = "#{sql} RETURNING #{quote_column_name(pk)} INTO :returning_id"
             (binds = binds.dup) << ActiveRecord::Relation::QueryAttribute.new("returning_id", nil, Type::OracleEnhanced::Integer.new)
@@ -91,8 +95,8 @@ module ActiveRecord
         end
 
         # New method in ActiveRecord 3.1
-        def exec_insert(sql, name = nil, binds = [], pk = nil, sequence_name = nil)
-          sql, binds = sql_for_insert(sql, pk, binds)
+        def exec_insert(sql, name = nil, binds = [], pk = nil, sequence_name = nil, returning: nil)
+          sql, binds = sql_for_insert(sql, pk, binds, returning)
           type_casted_binds = type_casted_binds(binds)
 
           log(sql, name, binds, type_casted_binds) do
@@ -101,10 +105,10 @@ module ActiveRecord
             returning_id_col = returning_id_index = nil
             with_retry do
               if without_prepared_statement?(binds)
-                cursor = @raw_connection.prepare(sql)
+                cursor = any_raw_connection.prepare(sql)
               else
                 unless @statements.key?(sql)
-                  @statements[sql] = @raw_connection.prepare(sql)
+                  @statements[sql] = any_raw_connection.prepare(sql)
                 end
 
                 cursor = @statements[sql]
@@ -141,12 +145,12 @@ module ActiveRecord
             with_retry do
               cached = false
               if without_prepared_statement?(binds)
-                cursor = @raw_connection.prepare(sql)
+                cursor = any_raw_connection.prepare(sql)
               else
                 if @statements.key?(sql)
                   cursor = @statements[sql]
                 else
-                  cursor = @statements[sql] = @raw_connection.prepare(sql)
+                  cursor = @statements[sql] = any_raw_connection.prepare(sql)
                 end
 
                 cursor.bind_params(type_casted_binds)
@@ -164,7 +168,7 @@ module ActiveRecord
         alias :exec_delete :exec_update
 
         def begin_db_transaction # :nodoc:
-          @raw_connection.autocommit = false
+          any_raw_connection.autocommit = false
         end
 
         def transaction_isolation_levels
@@ -172,8 +176,8 @@ module ActiveRecord
           # No read uncommitted nor repeatable read supppoted
           # http://docs.oracle.com/cd/E11882_01/server.112/e26088/statements_10005.htm#SQLRF55422
           {
-            read_committed:   "READ COMMITTED",
-            serializable:     "SERIALIZABLE"
+            read_committed: "READ COMMITTED",
+            serializable: "SERIALIZABLE"
           }
         end
 
@@ -183,15 +187,15 @@ module ActiveRecord
         end
 
         def commit_db_transaction # :nodoc:
-          @raw_connection.commit
+          any_raw_connection.commit
         ensure
-          @raw_connection.autocommit = true
+          any_raw_connection.autocommit = true
         end
 
         def exec_rollback_db_transaction # :nodoc:
-          @raw_connection.rollback
+          any_raw_connection.rollback
         ensure
-          @raw_connection.autocommit = true
+          any_raw_connection.autocommit = true
         end
 
         def create_savepoint(name = current_savepoint_name) # :nodoc:
@@ -265,14 +269,14 @@ module ActiveRecord
                 raise ActiveRecord::RecordNotFound, "statement #{sql} returned no rows"
               end
               lob = lob_record[col.name]
-              @raw_connection.write_lob(lob, value.to_s, col.type == :binary)
+              any_raw_connection.write_lob(lob, value.to_s, col.type == :binary)
             end
           end
         end
 
         private
           def with_retry
-            @raw_connection.with_retry do
+            any_raw_connection.with_retry do
               yield
             rescue
               @statements.clear

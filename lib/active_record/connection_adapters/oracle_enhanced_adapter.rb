@@ -70,11 +70,9 @@ module ActiveRecord
         # allows the enhanced adapter to look like the OracleAdapter. Useful to pick up
         # conditionals in the rails activerecord test suite
         require "active_record/connection_adapters/emulation/oracle_adapter"
-        ConnectionAdapters::OracleAdapter.new(
-          ConnectionAdapters::OracleEnhanced::Connection.create(config), logger, config)
+        ConnectionAdapters::OracleAdapter.new(config)
       else
-        ConnectionAdapters::OracleEnhancedAdapter.new(
-          ConnectionAdapters::OracleEnhanced::Connection.create(config), logger, config)
+        ConnectionAdapters::OracleEnhancedAdapter.new(config)
       end
     end
   end
@@ -160,6 +158,10 @@ module ActiveRecord
       include OracleEnhanced::DatabaseLimits
       include OracleEnhanced::DbmsOutput
       include OracleEnhanced::StructureDump
+
+      def self.create_connection(config)
+        ConnectionAdapters::OracleEnhanced::Connection.create(config)
+      end
 
       ##
       # :singleton-method:
@@ -251,6 +253,8 @@ module ActiveRecord
         @enable_dbms_output = false
         @do_not_prefetch_primary_key = {}
         @columns_cache = {}
+
+        @connection_parameters ||= @config
       end
 
       ADAPTER_NAME = "OracleEnhanced"
@@ -432,12 +436,12 @@ module ActiveRecord
 
       def auto_retry=(value) # :nodoc:
         @auto_retry = value
-        @raw_connection.auto_retry = value if @raw_connection
+        @raw_connection&.auto_retry = value if @raw_connection
       end
 
       # return raw OCI8 or JDBC connection
       def raw_connection
-        @raw_connection.raw_connection
+        any_raw_connection.raw_connection
       end
 
       # Returns true if the connection is active.
@@ -446,21 +450,20 @@ module ActiveRecord
         # #active? method is also available, but that simply returns the
         # last known state, which isn't good enough if the connection has
         # gone stale since the last use.
-        @raw_connection.ping
+        !!@raw_connection&.ping
       rescue OracleEnhanced::ConnectionException
         false
       end
 
       def reconnect
-        @raw_connection.reset # tentative
+        @raw_connection.nil? ? connect : @raw_connection.reset # tentative
       rescue OracleEnhanced::ConnectionException
         connect
       end
 
       # Reconnects to the database.
       def reconnect! # :nodoc:
-        super
-        @raw_connection.reset!
+        @raw_connection.nil? ? connect : @raw_connection.reset!
       rescue OracleEnhanced::ConnectionException => e
         @logger.warn "#{adapter_name} automatic reconnection failed: #{e.message}" if @logger
       end
@@ -478,7 +481,7 @@ module ActiveRecord
       # Disconnects from the database.
       def disconnect! # :nodoc:
         super
-        @raw_connection.logoff rescue nil
+        @raw_connection&.logoff
       end
 
       def discard!
@@ -673,12 +676,12 @@ module ActiveRecord
         #
         # It does not construct DISTINCT clause. Just return column names for distinct.
         order_columns = orders.reject(&:blank?).map { |s|
-            s = visitor.compile(s) unless s.is_a?(String)
-            # remove any ASC/DESC modifiers
-            s.gsub(/\s+(ASC|DESC)\s*?/i, "")
-          }.reject(&:blank?).map.with_index { |column, i|
-            "FIRST_VALUE(#{column}) OVER (PARTITION BY #{columns} ORDER BY #{column}) AS alias_#{i}__"
-          }
+          s = visitor.compile(s) unless s.is_a?(String)
+          # remove any ASC/DESC modifiers
+          s.gsub(/\s+(ASC|DESC)\s*?/i, "")
+        }.reject(&:blank?).map.with_index { |column, i|
+          "FIRST_VALUE(#{column}) OVER (PARTITION BY #{columns} ORDER BY #{column}) AS alias_#{i}__"
+        }
         (order_columns << super).join(", ")
       end
 
@@ -696,7 +699,7 @@ module ActiveRecord
       alias index_name_length max_identifier_length
 
       def get_database_version
-        @raw_connection.database_version
+        any_raw_connection.database_version
       end
 
       def check_version
@@ -721,17 +724,17 @@ module ActiveRecord
           def initialize_type_map(m)
             super
             # oracle
-            register_class_with_precision m, %r(WITH TIME ZONE)i,       Type::OracleEnhanced::TimestampTz
+            register_class_with_precision m, %r(WITH TIME ZONE)i, Type::OracleEnhanced::TimestampTz
             register_class_with_precision m, %r(WITH LOCAL TIME ZONE)i, Type::OracleEnhanced::TimestampLtz
-            register_class_with_limit m, %r(raw)i,            Type::OracleEnhanced::Raw
-            register_class_with_limit m, %r{^(char)}i,        Type::OracleEnhanced::CharacterString
-            register_class_with_limit m, %r{^(nchar)}i,       Type::OracleEnhanced::String
-            register_class_with_limit m, %r(varchar)i,        Type::OracleEnhanced::String
-            register_class_with_limit m, %r(clob)i,           Type::OracleEnhanced::Text
-            register_class_with_limit m, %r(nclob)i,           Type::OracleEnhanced::NationalCharacterText
+            register_class_with_limit m, %r(raw)i, Type::OracleEnhanced::Raw
+            register_class_with_limit m, %r{^(char)}i, Type::OracleEnhanced::CharacterString
+            register_class_with_limit m, %r{^(nchar)}i, Type::OracleEnhanced::String
+            register_class_with_limit m, %r(varchar)i, Type::OracleEnhanced::String
+            register_class_with_limit m, %r(clob)i, Type::OracleEnhanced::Text
+            register_class_with_limit m, %r(nclob)i, Type::OracleEnhanced::NationalCharacterText
 
             m.register_type "NCHAR", Type::OracleEnhanced::NationalCharacterString.new
-            m.alias_type %r(NVARCHAR2)i,    "NCHAR"
+            m.alias_type %r(NVARCHAR2)i, "NCHAR"
 
             m.register_type(%r(NUMBER)i) do |sql_type|
               scale = extract_scale(sql_type)
@@ -748,6 +751,16 @@ module ActiveRecord
               m.register_type %r(^NUMBER\(1\))i, Type::Boolean.new
             end
           end
+      end
+
+      def connect
+        @raw_connection = self.class.create_connection(@connection_parameters || @config)
+      rescue ConnectionNotEstablished => ex
+        raise ex.set_pool(@pool)
+      end
+
+      def any_raw_connection
+        @raw_connection || connect
       end
 
       def type_map
@@ -815,6 +828,8 @@ module ActiveRecord
       ActiveRecord::Type.register(:boolean, Type::OracleEnhanced::Boolean, adapter: :oracle_enhanced)
       ActiveRecord::Type.register(:json, Type::OracleEnhanced::Json, adapter: :oracle_enhanced)
     end
+
+    ActiveSupport.run_load_hooks(:active_record_oracle_enhanced_adapter, OracleEnhancedAdapter)
   end
 end
 
